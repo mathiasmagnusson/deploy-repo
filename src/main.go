@@ -15,8 +15,8 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v3"
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -24,11 +24,7 @@ type Config struct {
 	Commands []string `yaml:"commands"`
 }
 
-type Context struct {
-	SecretToken []byte
-}
-
-func (ctx Context) index(w http.ResponseWriter, r *http.Request) {
+func Handle(w http.ResponseWriter, r *http.Request) {
 	// TODO: also receive merged pull requests?
 	var body struct {
 		Repository struct {
@@ -80,13 +76,13 @@ func (ctx Context) index(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			if err, ok := err.(*exec.ExitError); ok {
 				w.Write([]byte(fmt.Sprintf(
-					"Deployment failed for %v %v!\nCommand: %v\nExit code: %v\nStderr: %s",
+					"Deployment failed for %v %v!\nCommand: %v\nExit code: %v\nStderr:",
 					body.Repository.Name,
 					body.Ref,
 					command,
 					err.ProcessState.ExitCode(),
-					string(err.Stderr),
 				)))
+				w.Write(err.Stderr)
 			} else {
 				w.Write([]byte(fmt.Sprintf(
 					"Deployment failed for %v %v!\nError: %s",
@@ -98,19 +94,22 @@ func (ctx Context) index(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+
 }
 
-func (ctx Context) VerifyToken(inner http.Handler) http.Handler {
+func VerifySignature(SecretToken []byte, inner http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedSignature := strings.TrimPrefix(r.Header.Get("X-Hub-Signature-256"), "sha256=")
 
-		h := hmac.New(sha256.New, ctx.SecretToken)
+		h := hmac.New(sha256.New, SecretToken)
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			log.Println(err)
 			return
 		}
 		if err := r.Body.Close(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			log.Println(err)
 			return
 		}
@@ -123,8 +122,8 @@ func (ctx Context) VerifyToken(inner http.Handler) http.Handler {
 			[]byte(receivedSignature),
 		)
 		if equal != 1 {
-			w.WriteHeader(400)
-			log.Println("Invalid signature")
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte("Invalid signature"))
 			return
 		}
 		inner.ServeHTTP(w, r)
@@ -132,13 +131,22 @@ func (ctx Context) VerifyToken(inner http.Handler) http.Handler {
 }
 
 func main() {
-	ctx := Context{
-		SecretToken: []byte(os.Getenv("SECRET_TOKEN")),
+	if err := godotenv.Load(); err != nil {
+		log.Println("Error while reading .env")
 	}
 
-	r := mux.NewRouter()
+	secretToken := []byte(os.Getenv("SECRET_TOKEN"))
 
-	r.HandleFunc("/", ctx.index).Methods(http.MethodPost)
+	if len(secretToken) < 16 {
+		log.Fatalln("Secret token too short or not provided")
+	}
 
-	log.Fatal(http.ListenAndServe("127.0.0.1:7293", ctx.VerifyToken(r)))
+	err := http.ListenAndServe(
+		"127.0.0.1:7293",
+		VerifySignature(
+			secretToken,
+			http.HandlerFunc(Handle),
+		),
+	)
+	log.Fatalln(err)
 }
