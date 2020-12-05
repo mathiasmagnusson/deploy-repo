@@ -80,7 +80,7 @@ func (ctx Context) index(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			if err, ok := err.(*exec.ExitError); ok {
 				w.Write([]byte(fmt.Sprintf(
-					"Deployment failed for %v %v!\nCommand: %v\nExit code: %v\nStdout: %s",
+					"Deployment failed for %v %v!\nCommand: %v\nExit code: %v\nStderr: %s",
 					body.Repository.Name,
 					body.Ref,
 					command,
