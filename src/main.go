@@ -14,87 +14,147 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	WorkDir  string   `yaml:"work_dir"`
-	Commands []string `yaml:"commands"`
+type RedeploymentCommand struct {
+	WorkDir  string   `yaml:"work_dir" json:"work_dir"`
+	Commands []string `yaml:"commands" json:"commands"`
 }
 
-func Handle(w http.ResponseWriter, r *http.Request) {
-	// TODO: also receive merged pull requests?
-	var body struct {
-		Repository struct {
-			Name string `json:"name"`
-		} `json:"repository"`
-		Ref string `json:"ref"`
-	}
-	err := json.NewDecoder(r.Body).Decode(&body)
-	if err != nil {
-		log.Println("json decoding error:", err)
-		return
-	}
+type Redeployment struct {
+	RedeploymentCommand
+	Results []Result `json:"results"`
+	Done    bool     `json:"done"`
+}
 
-	contents, err := ioutil.ReadFile("config.yml")
-	if err != nil {
-		log.Println("failed reading config file (config.yml):", err)
-		return
-	}
+type Result struct {
+	Output   string        `json:"output,omitempty"`
+	Start    time.Time     `json:"start"`
+	Duration time.Duration `json:"duration,omitempty"`
+}
 
-	var yamlFile map[string]map[string]Config
-	if err := yaml.Unmarshal(contents, &yamlFile); err != nil {
-		log.Println("failed parsing config file:", err)
-		return
-	}
+func (r *Redeployment) Run(id uuid.UUID, redeployments map[uuid.UUID]*Redeployment, mutex *sync.Mutex) {
+	for _, command := range r.Commands {
+		mutex.Lock()
 
-	sub, ok := yamlFile[body.Repository.Name]
-	if !ok {
-		log.Println(
-			"No deployment instructions for repository",
-			body.Repository.Name,
-		)
-		return
-	}
+		r.Results = append(r.Results, Result{
+			Start:    time.Now(),
+			Duration: 0,
+		})
 
-	config, ok := sub[body.Ref]
-	if !ok {
-		log.Println(
-			"No deployment instructions for ref",
-			body.Ref,
-		)
-		return
-	}
+		mutex.Unlock()
 
-	for _, command := range config.Commands {
 		cmd := exec.Command("sh", "-c", command)
-		cmd.Dir = config.WorkDir
+		cmd.Dir = r.WorkDir
 		err := cmd.Run()
+
+		mutex.Lock()
+		result := &r.Results[len(r.Results)-1]
+
+		result.Duration = time.Now().Sub(result.Start)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
 			if err, ok := err.(*exec.ExitError); ok {
-				w.Write([]byte(fmt.Sprintf(
-					"Deployment failed for %v %v!\nCommand: %v\nExit code: %v\nStderr:",
-					body.Repository.Name,
-					body.Ref,
-					command,
-					err.ProcessState.ExitCode(),
-				)))
-				w.Write(err.Stderr)
+				result.Output = string(err.Stderr)
 			} else {
-				w.Write([]byte(fmt.Sprintf(
-					"Deployment failed for %v %v!\nError: %s",
-					body.Repository.Name,
-					body.Ref,
-					err,
-				)))
+				result.Output = "<could not run command>: " + err.Error()
 			}
+			mutex.Unlock()
 			break
 		}
-	}
 
+		mutex.Unlock()
+	}
+	r.Done = true
+
+	time.Sleep(time.Minute)
+
+	delete(redeployments, id)
+}
+
+func GetRedeploymentStatus(redeployments map[uuid.UUID]*Redeployment, redeploymentsLock *sync.Mutex) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redeploymentsLock.Lock()
+		defer redeploymentsLock.Unlock()
+
+		idBytes, err := hex.DecodeString(strings.Trim(r.URL.Path, "/"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("ID is not valid hex"))
+			return
+		}
+
+		id, err := uuid.FromBytes(idBytes)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("ID is not of valid length"))
+			return
+		}
+
+		redeployment, ok := redeployments[id]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("No redeployment found with ID"))
+			return
+		}
+
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(200)
+
+		json.NewEncoder(w).Encode(redeployment)
+	})
+}
+
+func HandleWebhook(host string, addCommand func(RedeploymentCommand) uuid.UUID) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// TODO: also receive merged pull requests?
+		var body struct {
+			Repository struct {
+				Name string `json:"name"`
+			} `json:"repository"`
+			Ref string `json:"ref"`
+		}
+		err := json.NewDecoder(r.Body).Decode(&body)
+		if err != nil {
+			log.Println("json decoding error:", err)
+			return
+		}
+
+		contents, err := ioutil.ReadFile("config.yml")
+		if err != nil {
+			log.Println("failed reading config file (config.yml):", err)
+			return
+		}
+
+		var yamlFile map[string]map[string]RedeploymentCommand
+		if err := yaml.Unmarshal(contents, &yamlFile); err != nil {
+			log.Println("failed parsing config file:", err)
+			return
+		}
+
+		sub, ok := yamlFile[body.Repository.Name]
+		if !ok {
+			log.Println(
+				"WARNING: No deployment instructions for repository",
+				body.Repository.Name,
+			)
+			return
+		}
+
+		command, ok := sub[body.Ref]
+		if !ok {
+			return
+		}
+
+		id := addCommand(command)
+		idString := hex.EncodeToString(id[:])
+		w.Write([]byte(fmt.Sprintf("https://%s/%s", host, idString)))
+	})
 }
 
 func VerifySignature(SecretToken []byte, inner http.Handler) http.Handler {
@@ -136,17 +196,44 @@ func main() {
 	}
 
 	secretToken := []byte(os.Getenv("SECRET_TOKEN"))
+	host := os.Getenv("HOST")
 
 	if len(secretToken) < 16 {
 		log.Fatalln("Secret token too short or not provided")
 	}
 
+	redeployments := make(map[uuid.UUID]*Redeployment)
+	redeploymentsLock := new(sync.Mutex)
+
+	addCommand := func(command RedeploymentCommand) uuid.UUID {
+		redeploymentsLock.Lock()
+
+		id, err := uuid.NewRandom()
+		if err != nil {
+			log.Fatalln(err)
+		}
+		redeployment := &Redeployment{
+			RedeploymentCommand: command,
+		}
+		redeployments[id] = redeployment
+
+		redeploymentsLock.Unlock()
+
+		go redeployment.Run(id, redeployments, redeploymentsLock)
+
+		return id
+	}
+
 	err := http.ListenAndServe(
 		"127.0.0.1:7293",
-		VerifySignature(
-			secretToken,
-			http.HandlerFunc(Handle),
-		),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				VerifySignature(secretToken, HandleWebhook(host, addCommand)).ServeHTTP(w, r)
+			} else if r.Method == http.MethodGet {
+				GetRedeploymentStatus(redeployments, redeploymentsLock).
+					ServeHTTP(w, r)
+			}
+		}),
 	)
 	log.Fatalln(err)
 }
